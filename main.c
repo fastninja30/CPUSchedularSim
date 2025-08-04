@@ -154,6 +154,14 @@ int main(int argc, char *argv[]) {
     double overall_avg_io = ((cpu_bound_io_burst_count + io_bound_io_burst_count) > 0) ?
                                 ((cpu_bound_total_io_time + io_bound_total_io_time) / (cpu_bound_io_burst_count + io_bound_io_burst_count)) : 0.0;
 
+
+    cpu_bound_avg_cpu = ceil(cpu_bound_avg_cpu * 1000.0) / 1000.0;
+    io_bound_avg_cpu  = ceil(io_bound_avg_cpu * 1000.0) / 1000.0;
+    overall_avg_cpu   = ceil(overall_avg_cpu * 1000.0) / 1000.0;
+    cpu_bound_avg_io  = ceil(cpu_bound_avg_io * 1000.0) / 1000.0;
+    io_bound_avg_io = ceil(io_bound_avg_io * 1000.0) / 1000.0;
+    overall_avg_io = ceil(overall_avg_io * 1000.0) / 1000.0;
+
     fprintf(outfile, "-- number of processes: %d\n", n);
     fprintf(outfile, "-- number of CPU-bound processes: %d\n", ncpu);
     fprintf(outfile, "-- number of I/O-bound processes: %d\n", n - ncpu);
