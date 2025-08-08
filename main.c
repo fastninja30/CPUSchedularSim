@@ -4,6 +4,16 @@
 #include <math.h>
 #include <stdbool.h>
 
+/*
+    Changes from your original:
+    - Added srt_key() and split push_sorted() into push_sorted_sjf() and push_sorted_srt()
+      so SRT orders by predicted remaining time (tau - executed_so_far) with ID tiebreak.
+    - Added SRT preemption tie-break (equal predicted remaining => smaller ID preempts).
+    - Re-ordered same-timestamp handling so RR checks time-slice expiration *after*
+      processing I/O completions and arrivals at that timestamp.
+    - Ensured SRT re-enqueues (including preempted running process) use push_sorted_srt().
+*/
+
 //-----------------------------------------------------------------------------
 // DATA STRUCTURES & FORWARD DECLARATIONS
 //-----------------------------------------------------------------------------
@@ -35,7 +45,7 @@ struct Process {
     double tau;
     int burst_start_time; 
     int turnaround_start_time;
-    bool was_preempted_this_burst; // FIX for RR stat
+    bool was_preempted_this_burst; // For RR stat
     
     // Statistics
     double total_wait_time;
@@ -43,6 +53,8 @@ struct Process {
     int num_context_switches;
     int num_preemptions;
     int rr_bursts_in_slice;
+
+    bool requeue_from_preempt;     // NEW: mark delayed RR requeue
 };
 
 typedef struct Node {
@@ -89,8 +101,16 @@ void print_queue(Node* head) {
     }
 }
 
+static inline void dbg_enq(const char* why, int t, const char* who, Node* q_after) {
+    // Comment out if too noisy:
+    //printf("DBG %6d: ENQ %-4s via %-10s -> ", t, who, why); print_queue(q_after);
+}
+
+static inline void dbg_note(const char* what, int t) {
+    //printf("DBG %6d: %s\n", t, what);
+}
 void push_back(Node** head, Process* p) {
-    Node* new_node = malloc(sizeof(Node));
+    Node* new_node = (Node*)malloc(sizeof(Node));
     new_node->p = p;
     new_node->next = NULL;
     if (*head == NULL) {
@@ -113,25 +133,61 @@ Process* pop_front(Node** head) {
     return p;
 }
 
-void push_sorted(Node** head, Process* p) {
-    Node* new_node = malloc(sizeof(Node));
-    new_node->p = p;
-    Node* curr;
+int compare_processes(const void* a, const void* b) {
+    Process* pA = *(Process**)a;
+    Process* pB = *(Process**)b;
+    return strcmp(pA->id, pB->id);
+}
 
-    if (*head == NULL || (*head)->p->tau > p->tau || ((*head)->p->tau == p->tau && strcmp((*head)->p->id, p->id) > 0)) {
-        new_node->next = *head;
-        *head = new_node;
-    } else {
-        curr = *head;
-        while (curr->next != NULL && curr->next->p->tau < p->tau) {
-            curr = curr->next;
-        }
-        while (curr->next != NULL && curr->next->p->tau == p->tau && strcmp(curr->next->p->id, p->id) < 0) {
-            curr = curr->next;
-        }
-        new_node->next = curr->next;
-        curr->next = new_node;
+/* ---------- SRT helpers (new) ---------- */
+
+// predicted remaining = ceil(tau - executed_so_far)
+// executed_so_far = cpu_burst - remaining_cpu_time
+// If remaining_cpu_time == 0 (hasn't started this burst), executed_so_far = 0.
+static inline int srt_key(Process *p) {
+    int cpu = p->bursts[p->current_burst].cpu_time;
+    int executed = (p->remaining_cpu_time == 0) ? 0 : (cpu - p->remaining_cpu_time);
+    int pred = (int)ceil(p->tau - executed);
+    return (pred > 0) ? pred : 0;
+}
+
+/* Insert sorted by tau (SJF). Tiebreak by ID. */
+void push_sorted_sjf(Node** head, Process* p) {
+    Node* new_node = (Node*)malloc(sizeof(Node));
+    new_node->p = p;
+    new_node->next = NULL;
+
+    if (*head == NULL) { *head = new_node; return; }
+
+    Node *prev = NULL, *cur = *head;
+    while (cur) {
+        if (p->tau < cur->p->tau) break;
+        if (p->tau == cur->p->tau && strcmp(p->id, cur->p->id) < 0) break;
+        prev = cur; cur = cur->next;
     }
+    new_node->next = cur;
+    if (prev) prev->next = new_node; else *head = new_node;
+}
+
+/* Insert sorted by predicted remaining (SRT). Tiebreak by ID. */
+void push_sorted_srt(Node** head, Process* p) {
+    Node* new_node = (Node*)malloc(sizeof(Node));
+    new_node->p = p;
+    new_node->next = NULL;
+
+    if (*head == NULL) { *head = new_node; return; }
+
+    Node *prev = NULL, *cur = *head;
+    int keyp = srt_key(p);
+
+    while (cur) {
+        int keyc = srt_key(cur->p);
+        if (keyp < keyc) break;
+        if (keyp == keyc && strcmp(p->id, cur->p->id) < 0) break;
+        prev = cur; cur = cur->next;
+    }
+    new_node->next = cur;
+    if (prev) prev->next = new_node; else *head = new_node;
 }
 
 void reset_simulation_state(Process* master, Process* working, int n, double initial_tau) {
@@ -153,13 +209,10 @@ void reset_simulation_state(Process* master, Process* working, int n, double ini
         working[i].num_context_switches = 0;
         working[i].num_preemptions = 0;
         working[i].rr_bursts_in_slice = 0;
-    }
-}
 
-int compare_processes(const void* a, const void* b) {
-    Process* pA = *(Process**)a;
-    Process* pB = *(Process**)b;
-    return strcmp(pA->id, pB->id);
+        working[i].was_preempted_this_burst = false;
+        working[i].requeue_from_preempt = false;    
+    }
 }
 
 //-----------------------------------------------------------------------------
@@ -171,6 +224,11 @@ void run_simulation(const char* algo, Process* processes, int n, int ncpu, doubl
     PRINT_ALL_EVENTS = true;
     
     Node* ready_queue = NULL;
+
+    // Buffer for RR preempted processes at the *current* timestamp
+    Process* preempt_buf[n];
+    int preempt_cnt = 0;
+
     Process* running_process = NULL;
     Process* switching_in_process = NULL; 
     
@@ -187,6 +245,7 @@ void run_simulation(const char* algo, Process* processes, int n, int ncpu, doubl
     while (terminated_count < n) {
         int next_t = -1;
 
+        // Advance to the next interesting time
         if (running_process && (next_t == -1 || cpu_busy_until < next_t)) next_t = cpu_busy_until;
         if (!running_process && cpu_busy_until > time && (next_t == -1 || cpu_busy_until < next_t)) next_t = cpu_busy_until;
         if (switching_in_process && (next_t == -1 || switch_in_end_time < next_t)) next_t = switch_in_end_time;
@@ -195,48 +254,72 @@ void run_simulation(const char* algo, Process* processes, int n, int ncpu, doubl
             if (processes[i].state == NEW && (next_t == -1 || processes[i].arrival_time < next_t)) next_t = processes[i].arrival_time;
             if (processes[i].state == WAITING && (next_t == -1 || processes[i].io_completion_time < next_t)) next_t = processes[i].io_completion_time;
         }
+
+        // RR: consider the end of the current time slice if it comes before the burst end
         if (strcmp(algo, "RR") == 0 && running_process) {
-             int slice_end_time = running_process->burst_start_time + T_SLICE;
-             if (slice_end_time < cpu_busy_until && (next_t == -1 || slice_end_time < next_t)) next_t = slice_end_time;
+            int slice_end_time = running_process->burst_start_time + T_SLICE;
+            if (slice_end_time < cpu_busy_until && (next_t == -1 || slice_end_time < next_t)) next_t = slice_end_time;
         }
 
         if (next_t == -1) break; 
         
+        // Accrue CPU work for the running process up to next_t
         if (running_process) {
             int time_ran = next_t - time;
             running_process->remaining_cpu_time -= time_ran;
             total_cpu_active_time += time_ran;
         }
         time = next_t;
-        
-        if (time >= 10000 && PRINT_ALL_EVENTS) PRINT_ALL_EVENTS = true;
-        
-        // (a) CPU Burst Completion / Preemption
-        if (running_process && time >= cpu_busy_until) { 
+
+        /* ========= EVENT HANDLING at time =========
+           Order:
+           (1) CPU burst completion (if time reached the burst end)
+           (2) Switch-in completion
+           (3) I/O completions
+           (4) New arrivals
+           (5) (RR only) Time-slice expiration
+           (6) Enqueue any buffered RR preemptions
+           (7) Scheduler pickup
+        */
+
+        // (1) CPU Burst Completion
+        if (running_process && time >= cpu_busy_until) {
             running_process->total_turnaround_time += (time + T_CS / 2.0) - running_process->turnaround_start_time;
             
             if (PRINT_ALL_EVENTS && running_process->current_burst + 1 < running_process->num_bursts) {
                 if (strcmp(algo, "SJF") == 0 || strcmp(algo, "SRT") == 0)
-                    printf("time %dms: Process %s (tau %.0fms) completed a CPU burst; %d %s to go ", time, running_process->id, running_process->tau, running_process->num_bursts - running_process->current_burst - 1, (running_process->num_bursts - running_process->current_burst - 1 == 1) ? "burst" : "bursts");
+                    printf("time %dms: Process %s (tau %.0fms) completed a CPU burst; %d %s to go ",
+                           time, running_process->id, running_process->tau,
+                           running_process->num_bursts - running_process->current_burst - 1,
+                           (running_process->num_bursts - running_process->current_burst - 1 == 1) ? "burst" : "bursts");
                 else
-                    printf("time %dms: Process %s completed a CPU burst; %d %s to go ", time, running_process->id, running_process->num_bursts - running_process->current_burst - 1, (running_process->num_bursts - running_process->current_burst - 1 == 1) ? "burst" : "bursts");
+                    printf("time %dms: Process %s completed a CPU burst; %d %s to go ",
+                           time, running_process->id,
+                           running_process->num_bursts - running_process->current_burst - 1,
+                           (running_process->num_bursts - running_process->current_burst - 1 == 1) ? "burst" : "bursts");
                 print_queue(ready_queue);
             }
+
             if (strcmp(algo, "SJF") == 0 || strcmp(algo, "SRT") == 0) {
-                 double old_tau = running_process->tau;
-                 running_process->tau = ceil(ALPHA * running_process->bursts[running_process->current_burst].cpu_time + (1 - ALPHA) * old_tau);
-                 if (PRINT_ALL_EVENTS && running_process->current_burst + 1 < running_process->num_bursts) {
-                     printf("time %dms: Recalculated tau for process %s: old tau %.0fms ==> new tau %.0fms ", time, running_process->id, old_tau, running_process->tau);
-                     print_queue(ready_queue);
-                 }
+                double old_tau = running_process->tau;
+                running_process->tau = ceil(ALPHA * running_process->bursts[running_process->current_burst].cpu_time
+                                            + (1 - ALPHA) * old_tau);
+                if (PRINT_ALL_EVENTS && running_process->current_burst + 1 < running_process->num_bursts) {
+                    printf("time %dms: Recalculated tau for process %s: old tau %.0fms ==> new tau %.0fms ",
+                           time, running_process->id, old_tau, running_process->tau);
+                    print_queue(ready_queue);
+                }
             }
-            if (strcmp(algo, "RR")==0 && !running_process->was_preempted_this_burst) running_process->rr_bursts_in_slice++;
+
+            if (strcmp(algo, "RR") == 0 && !running_process->was_preempted_this_burst) {
+                running_process->rr_bursts_in_slice++;
+            }
             
             running_process->current_burst++;
             if (running_process->current_burst == running_process->num_bursts) {
                 running_process->state = TERMINATED;
                 terminated_count++;
-                if (PRINT_ALL_EVENTS || time >= 10000) {
+                if (PRINT_ALL_EVENTS) {
                     printf("time %dms: Process %s terminated ", time, running_process->id);
                     print_queue(ready_queue);
                 }
@@ -244,36 +327,220 @@ void run_simulation(const char* algo, Process* processes, int n, int ncpu, doubl
                 running_process->state = WAITING;
                 running_process->io_completion_time = time + T_CS / 2 + running_process->bursts[running_process->current_burst - 1].io_time;
                 if (PRINT_ALL_EVENTS) {
-                    printf("time %dms: Process %s switching out of CPU; blocking on I/O until time %dms ", time, running_process->id, running_process->io_completion_time);
+                    printf("time %dms: Process %s switching out of CPU; blocking on I/O until time %dms ",
+                           time, running_process->id, running_process->io_completion_time);
                     print_queue(ready_queue);
                 }
             }
             running_process = NULL;
             cpu_busy_until = time + T_CS/2;
-        } else if (strcmp(algo, "RR") == 0 && running_process && time == (running_process->burst_start_time + T_SLICE)) { 
+        }
+        
+        // (5) RR time-slice expiration (moved AFTER I/O + arrivals at same timestamp)
+        if (strcmp(algo, "RR") == 0 && running_process &&
+            time == (running_process->burst_start_time + T_SLICE) &&
+            time < cpu_busy_until) {
+
             if (ready_queue == NULL) {
-                 if (PRINT_ALL_EVENTS) {
-                     printf("time %dms: Time slice expired; no preemption because ready queue is empty ", time);
-                     print_queue(ready_queue);
-                 }
-                 running_process->was_preempted_this_burst = true;
-                 running_process->burst_start_time = time;
-            } else { 
-                running_process->num_preemptions++;
-                running_process->was_preempted_this_burst = true;
-                if(PRINT_ALL_EVENTS){
-                    printf("time %dms: Time slice expired; preempting process %s with %dms remaining ", time, running_process->id, running_process->remaining_cpu_time);
+                if (PRINT_ALL_EVENTS) {
+                    printf("time %dms: Time slice expired; no preemption because ready queue is empty ",
+                           time);
                     print_queue(ready_queue);
                 }
-                running_process->state = READY;
-                running_process->time_entered_ready = time;
-                push_back(&ready_queue, running_process);
+                running_process->was_preempted_this_burst = true;
+                running_process->burst_start_time = time; // continue immediately
+            } else {
+                running_process->num_preemptions++;
+                running_process->was_preempted_this_burst = true;
+                if (PRINT_ALL_EVENTS) {
+                    printf("time %dms: Time slice expired; preempting process %s with %dms remaining ",
+                           time, running_process->id, running_process->remaining_cpu_time);
+                    print_queue(ready_queue);
+                }
+                running_process->state = WAITING;
+                running_process->io_completion_time = time + T_CS/2;
+                running_process->requeue_from_preempt = true;
+
                 running_process = NULL;
                 cpu_busy_until = time + T_CS / 2;
             }
         }
-        
-        // (b) Handle switch-in completion
+
+        // (3) I/O Burst Completions
+        Process* io_completed[n]; int io_count = 0;
+        for (int i = 0; i < n; i++) {
+            if (processes[i].state == WAITING && processes[i].io_completion_time == time)
+                io_completed[io_count++] = &processes[i];
+        }
+        qsort(io_completed, io_count, sizeof(Process*), compare_processes);
+
+        for (int i = 0; i < io_count; i++) {
+            Process* p = io_completed[i];
+
+            if (p->requeue_from_preempt && strcmp(algo, "RR") == 0) {
+                // ✅ This is the delayed RR requeue (NOT a real I/O completion).
+                p->requeue_from_preempt = false;
+                p->state = READY;
+                p->time_entered_ready = time;
+                p->turnaround_start_time = time;
+
+                // FIFO for RR
+                push_back(&ready_queue, p);
+
+                // IMPORTANT: print NOTHING for this event (the spec doesn’t log it)
+                continue;
+            }
+
+            // Normal I/O completion path (unchanged)
+            bool preempted = false;
+            if (strcmp(algo, "SRT") == 0 && running_process) {
+                int running_rem = srt_key(running_process);
+                int newcomer = srt_key(p);
+                if (newcomer < running_rem ||
+                (newcomer == running_rem && strcmp(p->id, running_process->id) < 0)) {
+                    preempted = true;
+                }
+            }
+
+            p->state = READY;
+            p->time_entered_ready = time;
+            p->turnaround_start_time = time;
+
+            if (strcmp(algo, "FCFS") == 0 || strcmp(algo, "RR") == 0) {
+                push_back(&ready_queue, p);
+            } else if (strcmp(algo, "SJF") == 0) {
+                push_sorted_sjf(&ready_queue, p);
+            } else {
+                push_sorted_srt(&ready_queue, p);
+            }
+
+            if (preempted) {
+                running_process->num_preemptions++;
+                int running_rem = srt_key(running_process);
+                if (PRINT_ALL_EVENTS) {
+                    printf("time %dms: Process %s (tau %.0fms) completed I/O; preempting %s (predicted remaining time %dms) ",
+                        time, p->id, p->tau, running_process->id, running_rem);
+                    print_queue(ready_queue);
+                }
+                running_process->state = READY;
+                running_process->time_entered_ready = time;
+                push_sorted_srt(&ready_queue, running_process);
+                running_process = NULL;
+                cpu_busy_until = time + T_CS / 2;
+            } else {
+                if (PRINT_ALL_EVENTS) {
+                    if (strcmp(algo, "SJF") == 0 || strcmp(algo, "SRT") == 0) 
+                        printf("time %dms: Process %s (tau %.0fms) completed I/O; added to ready queue ",
+                            time, p->id, p->tau);
+                    else
+                        printf("time %dms: Process %s completed I/O; added to ready queue ",
+                            time, p->id);
+                    print_queue(ready_queue);
+                }
+            }
+        }
+
+        // (4) New Process Arrivals
+        Process* arrived[n]; int arr_count = 0;
+        for (int i = 0; i < n; i++) {
+            if (processes[i].state == NEW && processes[i].arrival_time == time)
+                arrived[arr_count++] = &processes[i];
+        }
+        qsort(arrived, arr_count, sizeof(Process*), compare_processes);
+
+        for (int i = 0; i < arr_count; i++) {
+            Process* p = arrived[i];
+
+            bool preempted = false;
+            if (strcmp(algo, "SRT") == 0 && running_process) {
+                int running_rem = srt_key(running_process);
+                int newcomer = srt_key(p); // (remaining==0 -> uses tau)
+                if (newcomer < running_rem ||
+                   (newcomer == running_rem && strcmp(p->id, running_process->id) < 0)) {
+                    preempted = true;
+                }
+            }
+
+            p->state = READY;
+            p->time_entered_ready = time;
+            p->turnaround_start_time = time;
+
+            if (strcmp(algo, "FCFS") == 0 || strcmp(algo, "RR") == 0) {
+                push_back(&ready_queue, p);
+                dbg_enq("ARRIVAL", time, p->id, ready_queue);
+            } else if (strcmp(algo, "SJF") == 0) {
+                push_sorted_sjf(&ready_queue, p);
+            } else { // SRT
+                push_sorted_srt(&ready_queue, p);
+            }
+
+            if (preempted) {
+                running_process->num_preemptions++;
+                int running_rem = srt_key(running_process);
+                if (PRINT_ALL_EVENTS) {
+                    printf("time %dms: Process %s (tau %.0fms) arrived; preempting %s (predicted remaining time %dms) ",
+                           time, p->id, p->tau, running_process->id, running_rem);
+                    print_queue(ready_queue);
+                }
+                running_process->state = READY;
+                running_process->time_entered_ready = time;
+                push_sorted_srt(&ready_queue, running_process);
+                running_process = NULL;
+                cpu_busy_until = time + T_CS / 2;
+            } else {
+                if (PRINT_ALL_EVENTS) {
+                    if (strcmp(algo, "SJF") == 0 || strcmp(algo, "SRT") == 0) 
+                        printf("time %dms: Process %s (tau %.0fms) arrived; added to ready queue ",
+                               time, p->id, p->tau);
+                    else
+                        printf("time %dms: Process %s arrived; added to ready queue ",
+                               time, p->id);
+                    print_queue(ready_queue);
+                }
+            }
+        }
+
+        // (5) RR time-slice expiration (moved AFTER I/O + arrivals at same timestamp)
+        if (strcmp(algo, "RR") == 0 && running_process &&
+            time == (running_process->burst_start_time + T_SLICE) &&
+            time < cpu_busy_until) {
+
+            if (ready_queue == NULL) {
+                if (PRINT_ALL_EVENTS) {
+                    printf("time %dms: Time slice expired; no preemption because ready queue is empty ",
+                           time);
+                    print_queue(ready_queue);
+                }
+                running_process->was_preempted_this_burst = true;
+                running_process->burst_start_time = time; // continue immediately
+            } else {
+                running_process->num_preemptions++;
+                running_process->was_preempted_this_burst = true;
+                if (PRINT_ALL_EVENTS) {
+                    printf("time %dms: Time slice expired; preempting process %s with %dms remaining ",
+                           time, running_process->id, running_process->remaining_cpu_time);
+                    print_queue(ready_queue);
+                }
+                running_process->state = WAITING;
+                running_process->io_completion_time = time + T_CS/2;
+                running_process->requeue_from_preempt = true;
+
+                running_process = NULL;
+                cpu_busy_until = time + T_CS / 2;
+            }
+        }
+
+        // (6) After handling events at this same 'time',
+        // enqueue any RR preempted processes (buffered).
+        if (preempt_cnt > 0) {
+            //qsort(preempt_buf, preempt_cnt, sizeof(Process*), compare_processes);
+            for (int k = 0; k < preempt_cnt; k++) {
+                push_back(&ready_queue, preempt_buf[k]);
+                dbg_enq("PREEMPT", time, preempt_buf[k]->id, ready_queue);
+            }
+            preempt_cnt = 0;
+        }
+        // (2) Handle switch-in completion
         if (switching_in_process && time == switch_in_end_time) {
             running_process = switching_in_process;
             switching_in_process = NULL;
@@ -282,125 +549,27 @@ void run_simulation(const char* algo, Process* processes, int n, int ncpu, doubl
             running_process->state = RUNNING;
             running_process->burst_start_time = time;
             cpu_busy_until = time + running_process->remaining_cpu_time;
+
             if (PRINT_ALL_EVENTS) {
                 printf("time %dms: Process %s", time, running_process->id);
-                if (strcmp(algo, "SJF") == 0 || strcmp(algo, "SRT") == 0) printf(" (tau %.0fms)", running_process->tau);
+                if (strcmp(algo, "SJF") == 0 || strcmp(algo, "SRT") == 0)
+                    printf(" (tau %.0fms)", running_process->tau);
                 printf(" started using the CPU ");
                 if (running_process->remaining_cpu_time != running_process->bursts[running_process->current_burst].cpu_time)
-                    printf("for remaining %dms of %dms burst ", running_process->remaining_cpu_time, running_process->bursts[running_process->current_burst].cpu_time);
+                    printf("for remaining %dms of %dms burst ",
+                           running_process->remaining_cpu_time,
+                           running_process->bursts[running_process->current_burst].cpu_time);
                 else
                     printf("for %dms burst ", running_process->remaining_cpu_time);
                 print_queue(ready_queue);
             }
         }
-
-        // (c) I/O Burst Completions
-        Process* io_completed[n]; int io_count = 0;
-        for (int i = 0; i < n; i++) {
-            if (processes[i].state == WAITING && processes[i].io_completion_time == time) io_completed[io_count++] = &processes[i];
-        }
-        qsort(io_completed, io_count, sizeof(Process*), compare_processes);
-        for (int i = 0; i < io_count; i++) {
-            Process* p = io_completed[i];
-            bool preempted = false;
-            if (strcmp(algo, "SRT") == 0 && running_process) {
-                // BUG FIX: Use 'running_process->bursts' not 'p->bursts'
-                int accumulated_time = running_process->bursts[running_process->current_burst].cpu_time - running_process->remaining_cpu_time;
-                int rem_tau = running_process->tau - accumulated_time;
-                if (p->tau < rem_tau) { preempted = true; }
-            }
-
-            p->state = READY;
-            p->time_entered_ready = time;
-            p->turnaround_start_time = time;
-            if (strcmp(algo, "FCFS") == 0 || strcmp(algo, "RR") == 0) push_back(&ready_queue, p);
-            else push_sorted(&ready_queue, p);
-            
-            if (preempted) {
-                running_process->num_preemptions++;
-                // BUG FIX: Use 'running_process->bursts' not 'p->bursts' for the print message
-                int accumulated_time = running_process->bursts[running_process->current_burst].cpu_time - running_process->remaining_cpu_time;
-                int rem_tau = running_process->tau - accumulated_time;
-                if (PRINT_ALL_EVENTS) {
-                     printf("time %dms: Process %s (tau %.0fms) completed I/O; preempting %s (predicted remaining time %dms) ", time, p->id, p->tau, running_process->id, rem_tau > 0 ? rem_tau : 0);
-                     print_queue(ready_queue);
-                }
-                running_process->state = READY;
-                running_process->time_entered_ready = time;
-                push_sorted(&ready_queue, running_process);
-                running_process = NULL;
-                cpu_busy_until = time + T_CS / 2;
-            } else {
-                if (PRINT_ALL_EVENTS) {
-                    if (strcmp(algo, "SJF") == 0 || strcmp(algo, "SRT") == 0) 
-                        printf("time %dms: Process %s (tau %.0fms) completed I/O; added to ready queue ", time, p->id, p->tau);
-                    else
-                        printf("time %dms: Process %s completed I/O; added to ready queue ", time, p->id);
-                    print_queue(ready_queue);
-                }
-            }
-        }
-
-        // (d) New Process Arrivals
-        Process* arrived[n]; int arr_count = 0;
-        for (int i = 0; i < n; i++) {
-            if (processes[i].state == NEW && processes[i].arrival_time == time) arrived[arr_count++] = &processes[i];
-        }
-        qsort(arrived, arr_count, sizeof(Process*), compare_processes);
-        for (int i = 0; i < arr_count; i++) {
-            Process* p = arrived[i];
-
-            // BUG FIX: Added full preemption logic for new arrivals, which was missing.
-            bool preempted = false;
-            if (strcmp(algo, "SRT") == 0 && running_process) {
-                int accumulated_time = running_process->bursts[running_process->current_burst].cpu_time - running_process->remaining_cpu_time;
-                int rem_tau = running_process->tau - accumulated_time;
-                if (p->tau < rem_tau) {
-                    preempted = true;
-                }
-            }
-
-            p->state = READY;
-            p->time_entered_ready = time;
-            p->turnaround_start_time = time;
-            if (strcmp(algo, "FCFS") == 0 || strcmp(algo, "RR") == 0) push_back(&ready_queue, p);
-            else push_sorted(&ready_queue, p);
-
-            if (preempted) {
-                running_process->num_preemptions++;
-                int accumulated_time = running_process->bursts[running_process->current_burst].cpu_time - running_process->remaining_cpu_time;
-                int rem_tau = running_process->tau - accumulated_time;
-                if (PRINT_ALL_EVENTS) {
-                    // Analogous preemption message for a new arrival
-                    printf("time %dms: Process %s (tau %.0fms) arrived; preempting %s (predicted remaining time %dms) ", time, p->id, p->tau, running_process->id, rem_tau > 0 ? rem_tau : 0);
-                    print_queue(ready_queue);
-                }
-                running_process->state = READY;
-                running_process->time_entered_ready = time;
-                push_sorted(&ready_queue, running_process);
-                running_process = NULL;
-                cpu_busy_until = time + T_CS / 2;
-            } else {
-                if (PRINT_ALL_EVENTS) {
-                    if (strcmp(algo, "SJF") == 0 || strcmp(algo, "SRT") == 0) 
-                        printf("time %dms: Process %s (tau %.0fms) arrived; added to ready queue ", time, p->id, p->tau);
-                    else
-                        printf("time %dms: Process %s arrived; added to ready queue ", time, p->id);
-                    print_queue(ready_queue);
-                }
-            }
-        }
-
-        // (e) Process starts using the CPU (Scheduler)
+        // (7) Scheduler: pick next ready if CPU idle and no switch-in in progress
         if (!running_process && !switching_in_process && time >= cpu_busy_until && ready_queue != NULL) {
             Process* p = pop_front(&ready_queue);
             p->num_context_switches++;
             
             long wait_this_time = time - p->time_entered_ready;
-            if ((strcmp(algo, "SRT") == 0 || strcmp(algo, "RR") == 0) && p->remaining_cpu_time > 0 && p->remaining_cpu_time < p->bursts[p->current_burst].cpu_time) {
-                // This logic seems suspect but we will leave it as is per the original code's intent
-                wait_this_time -= (T_CS / 2);
-            }
             p->total_wait_time += wait_this_time;
 
             if (p->remaining_cpu_time == 0) {
@@ -461,9 +630,12 @@ void run_simulation(const char* algo, Process* processes, int n, int ncpu, doubl
     fprintf(outfile, "-- I/O-bound number of preemptions: %d\n", p_io);
     fprintf(outfile, "-- overall number of preemptions: %d\n", p_cpu + p_io);
     if (strcmp(algo, "RR") == 0) {
-        fprintf(outfile, "-- CPU-bound percentage of CPU bursts completed within one time slice: %.3f%%\n", bursts_cpu ? ceil_3dp(100.0 * rr_slice_cpu / bursts_cpu) : 0.000);
-        fprintf(outfile, "-- I/O-bound percentage of CPU bursts completed within one time slice: %.3f%%\n", bursts_io ? ceil_3dp(100.0 * rr_slice_io / bursts_io) : 0.000);
-        fprintf(outfile, "-- overall percentage of CPU bursts completed within one time slice: %.3f%%\n", total_bursts_count ? ceil_3dp(100.0 * (rr_slice_cpu+rr_slice_io) / total_bursts_count) : 0.000);
+        fprintf(outfile, "-- CPU-bound percentage of CPU bursts completed within one time slice: %.3f%%\n",
+                bursts_cpu ? ceil_3dp(100.0 * rr_slice_cpu / bursts_cpu) : 0.000);
+        fprintf(outfile, "-- I/O-bound percentage of CPU bursts completed within one time slice: %.3f%%\n",
+                bursts_io ? ceil_3dp(100.0 * rr_slice_io / bursts_io) : 0.000);
+        fprintf(outfile, "-- overall percentage of CPU bursts completed within one time slice: %.3f%%\n",
+                total_bursts_count ? ceil_3dp(100.0 * (rr_slice_cpu+rr_slice_io) / total_bursts_count) : 0.000);
     }
     fclose(outfile);
 }
@@ -472,9 +644,12 @@ void run_simulation(const char* algo, Process* processes, int n, int ncpu, doubl
 // MAIN FUNCTION
 //-----------------------------------------------------------------------------
 int main(int argc, char *argv[]) {
-    setvbuf( stdout, NULL,_IONBF, 0);
+    setvbuf(stdout, NULL, _IONBF, 0);
 
-    if (argc != 9) { fprintf(stderr, "ERROR: Invalid number of command-line arguments. Expected 8.\n"); return EXIT_FAILURE; }
+    if (argc != 9) {
+        fprintf(stderr, "ERROR: Invalid number of command-line arguments. Expected 8.\n");
+        return EXIT_FAILURE;
+    }
     int n = atoi(argv[1]);
     int ncpu = atoi(argv[2]);
     long seed = atol(argv[3]);
@@ -493,7 +668,7 @@ int main(int argc, char *argv[]) {
     if (T_SLICE <= 0) { fprintf(stderr, "ERROR: Time slice t_slice must be a positive integer.\n"); return EXIT_FAILURE; }
     
     srand48(seed);
-    Process* master_processes = malloc(sizeof(Process) * n);
+    Process* master_processes = (Process*)malloc(sizeof(Process) * n);
     double initial_tau = 1.0 / lambda;
 
     long double cpu_bound_total_cpu_time = 0; double cpu_bound_cpu_burst_count = 0;
@@ -509,27 +684,29 @@ int main(int argc, char *argv[]) {
         Process* p = &master_processes[i];
         p->is_cpu_bound = (i < ncpu);
         sprintf(p->id, "%c%d", 'A' + (i / 10), i % 10);
-        p->arrival_time = floor(next_exp(lambda, upper_bound));
-        p->num_bursts = ceil(drand48() * 32.0);
+        p->arrival_time = (int)floor(next_exp(lambda, upper_bound));
+        p->num_bursts = (int)ceil(drand48() * 32.0);
         if (p->num_bursts == 0) p->num_bursts = 1;
-        p->bursts = malloc(sizeof(Burst) * p->num_bursts);
+        p->bursts = (Burst*)malloc(sizeof(Burst) * p->num_bursts);
 
-        printf("%s process %s: arrival time %dms; %d CPU %s\n", p->is_cpu_bound ? "CPU-bound" : "I/O-bound", p->id, p->arrival_time, p->num_bursts, (p->num_bursts == 1) ? "burst" : "bursts");
+        printf("%s process %s: arrival time %dms; %d CPU %s\n",
+               p->is_cpu_bound ? "CPU-bound" : "I/O-bound",
+               p->id, p->arrival_time, p->num_bursts, (p->num_bursts == 1) ? "burst" : "bursts");
 
         for (int j = 0; j < p->num_bursts; j++) {
             double cpu_time = ceil(next_exp(lambda, upper_bound));
             if (p->is_cpu_bound) cpu_time *= 4;
             p->bursts[j].cpu_time = (int)cpu_time;
-            if (p->is_cpu_bound) { cpu_bound_total_cpu_time += cpu_time; cpu_bound_cpu_burst_count++; } else { io_bound_total_cpu_time += cpu_time; io_bound_cpu_burst_count++; }
+            if (p->is_cpu_bound) { cpu_bound_total_cpu_time += cpu_time; cpu_bound_cpu_burst_count++; }
+            else { io_bound_total_cpu_time += cpu_time; io_bound_cpu_burst_count++; }
 
             if (j < p->num_bursts - 1) {
                 double io_time_base = ceil(next_exp(lambda, upper_bound));
                 p->bursts[j].io_time = p->is_cpu_bound ? (int)io_time_base : (int)io_time_base * 8;
-                if (p->is_cpu_bound) { cpu_bound_total_io_time += p->bursts[j].io_time; cpu_bound_io_burst_count++; } else { io_bound_total_io_time += p->bursts[j].io_time; io_bound_io_burst_count++; }
-                //printf("==> CPU burst %dms ==> I/O burst %dms\n", p->bursts[j].cpu_time, p->bursts[j].io_time);
+                if (p->is_cpu_bound) { cpu_bound_total_io_time += p->bursts[j].io_time; cpu_bound_io_burst_count++; }
+                else { io_bound_total_io_time += p->bursts[j].io_time; io_bound_io_burst_count++; }
             } else {
                 p->bursts[j].io_time = 0;
-                //printf("==> CPU burst %dms\n", p->bursts[j].cpu_time);
             }
         }
     }
@@ -551,7 +728,7 @@ int main(int argc, char *argv[]) {
     printf("\n<<< PROJECT PART II\n");
     printf("<<< -- t_cs=%dms; alpha=%.2f; t_slice=%dms", T_CS, ALPHA, T_SLICE);
 
-    Process* working_processes = malloc(sizeof(Process) * n);
+    Process* working_processes = (Process*)malloc(sizeof(Process) * n);
     
     reset_simulation_state(master_processes, working_processes, n, initial_tau);
     srand48(seed);

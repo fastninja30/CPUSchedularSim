@@ -39,34 +39,34 @@ Algorithm SJF
 -- overall number of preemptions: 0
 
 Algorithm SRT
--- CPU utilization: 97.891%
--- CPU-bound average wait time: 3544.982 ms
--- I/O-bound average wait time: 3397.821 ms
--- overall average wait time: 3486.521 ms
--- CPU-bound average turnaround time: 3973.482 ms
--- I/O-bound average turnaround time: 3491.614 ms
--- overall average turnaround time: 3782.055 ms
+-- CPU utilization: 97.621%
+-- CPU-bound average wait time: 3987.255 ms
+-- I/O-bound average wait time: 856.290 ms
+-- overall average wait time: 2743.447 ms
+-- CPU-bound average turnaround time: 4414.619 ms
+-- I/O-bound average turnaround time: 949.973 ms
+-- overall average turnaround time: 3038.253 ms
 -- CPU-bound number of context switches: 346
--- I/O-bound number of context switches: 158
--- overall number of context switches: 504
+-- I/O-bound number of context switches: 161
+-- overall number of context switches: 507
 -- CPU-bound number of preemptions: 126
--- I/O-bound number of preemptions: 13
--- overall number of preemptions: 139
+-- I/O-bound number of preemptions: 16
+-- overall number of preemptions: 142
 
 Algorithm RR
--- CPU utilization: 92.950%
--- CPU-bound average wait time: 4047.000 ms
--- I/O-bound average wait time: 1642.566 ms
--- overall average wait time: 3091.814 ms
--- CPU-bound average turnaround time: 4496.564 ms
--- I/O-bound average turnaround time: 1740.000 ms
--- overall average turnaround time: 3401.491 ms
--- CPU-bound number of context switches: 1504
+-- CPU utilization: 92.937%
+-- CPU-bound average wait time: 4050.219 ms
+-- I/O-bound average wait time: 1639.842 ms
+-- overall average wait time: 3092.672 ms
+-- CPU-bound average turnaround time: 631.250 ms
+-- I/O-bound average turnaround time: 868.118 ms
+-- overall average turnaround time: 725.348 ms
+-- CPU-bound number of context switches: 1508
 -- I/O-bound number of context switches: 289
--- overall number of context switches: 1793
--- CPU-bound number of preemptions: 1284
+-- overall number of context switches: 1797
+-- CPU-bound number of preemptions: 1288
 -- I/O-bound number of preemptions: 144
--- overall number of preemptions: 1428
+-- overall number of preemptions: 1432
 -- CPU-bound percentage of CPU bursts completed within one time slice: 14.546%
 -- I/O-bound percentage of CPU bursts completed within one time slice: 54.483%
 -- overall percentage of CPU bursts completed within one time slice: 30.411%
